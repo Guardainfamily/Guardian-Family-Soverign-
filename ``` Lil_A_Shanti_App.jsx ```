@@ -1,0 +1,1715 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, getDoc, collection, query, orderBy, onSnapshot, addDoc, updateDoc, deleteDoc } from 'firebase/firestore';
+
+// Define Firebase configuration and app ID (provided by the Canvas environment)
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Helper function to convert base64 to ArrayBuffer
+function base64ToArrayBuffer(base64) {
+  const binaryString = window.atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+// Helper function to convert PCM to WAV
+function pcmToWav(pcmData, sampleRate) {
+  const numChannels = 1; // Mono audio
+  const bytesPerSample = 2; // 16-bit PCM
+  const byteRate = sampleRate * numChannels * bytesPerSample;
+  const blockAlign = numChannels * bytesPerSample;
+
+  const wavBuffer = new ArrayBuffer(44 + pcmData.byteLength);
+  const view = new DataView(wavBuffer);
+
+  // RIFF chunk
+  writeString(view, 0, 'RIFF');
+  view.setUint32(4, 36 + pcmData.byteLength, true);
+  writeString(view, 8, 'WAVE');
+
+  // FMT chunk
+  writeString(view, 12, 'fmt ');
+  view.setUint32(16, 16, true); // chunkSize
+  view.setUint16(20, 1, true); // audioFormat (PCM)
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 16, true); // bitsPerSample
+
+  // DATA chunk
+  writeString(view, 36, 'data');
+  view.setUint32(40, pcmData.byteLength, true);
+
+  // Write PCM data
+  const pcmBytes = new Uint8Array(pcmData.buffer);
+  for (let i = 0; i < pcmBytes.length; i++) {
+    view.setUint8(44 + i, pcmBytes[i]);
+  }
+
+  return new Blob([wavBuffer], { type: 'audio/wav' });
+}
+
+function writeString(view, offset, string) {
+  for (let i = 0; i < string.length; i++) {
+    view.setUint8(offset + i, string.charCodeAt(i));
+  }
+}
+
+// Main App Component
+function App() {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+
+  // Mood Tracker & Affirmations
+  const [moodEntries, setMoodEntries] = useState([]);
+  const [currentMood, setCurrentMood] = useState('');
+  const [affirmations, setAffirmations] = useState([]);
+  const [newAffirmation, setNewAffirmation] = useState(''); // Corrected initialization
+
+  // Chat & Voice
+  const [chatHistory, setChatHistory] = useState([]);
+  const [currentChatMessage, setCurrentChatMessage] = useState('');
+  const [lilAShantiResponse, setLilAShantiResponse] = useState("Hello! I'm Lil A-Shanti. How can I bring a sense of calm and focus to your day?");
+  const [isListening, setIsListening] = useState(false);
+  const recognitionRef = useRef(null); // Ref for SpeechRecognition object
+  const chatMessagesEndRef = useRef(null); // Ref for scrolling chat
+
+  // Consultation Mode
+  const [consultationInput, setConsultationInput] = useState('');
+  const [consultationResponse, setConsultationResponse] = useState('');
+  const [consultationHistory, setConsultationHistory] = useState([]);
+
+  // Role-play Mode
+  const [rolePlayScenario, setRolePlayScenario] = useState('');
+  const [rolePlayPersona, setRolePlayPersona] = useState('');
+  const [rolePlayConversation, setRolePlayConversation] = useState([]); // Corrected initialization
+  const [currentRolePlayMessage, setCurrentRolePlayMessage] = useState('');
+  const [rolePlayFeedback, setRolePlayFeedback] = useState('');
+  const [rolePlayHistory, setRolePlayHistory] = useState([]);
+  const rolePlayMessagesEndRef = useRef(null); // Ref for scrolling role-play chat
+
+  // New Features: Image Generation & Multimodality
+  const [imagePrompt, setImagePrompt] = useState('');
+  const [generatedImageUrl, setGeneratedImageUrl] = useState('');
+  const [multimodalFile, setMultimodalFile] = useState(null);
+  const [multimodalPrompt, setMultimodalPrompt] = useState('');
+  const [multimodalError, setMultimodalError] = useState(''); // New state for error message
+
+  // New Features: Goal Setting
+  const [newGoalName, setNewGoalName] = useState('');
+  const [goals, setGoals] = useState([]);
+
+  // New Features: Inner Garden (Guided Meditations)
+  const [meditationPrompt, setMeditationPrompt] = useState('');
+  const [generatedMeditation, setGeneratedMeditation] = '';
+
+  // New Features: Knowledge Library
+  const [knowledgeInput, setKnowledgeInput] = useState('');
+  const [knowledgeSummary, setKnowledgeSummary] = useState('');
+  const [knowledgeQuestion, setKnowledgeQuestion] = useState('');
+  const [knowledgeAnswer, setKnowledgeAnswer] = '';
+
+  // New Feature: Daily Reflection Journal
+  const [journalEntry, setJournalEntry] = useState('');
+  const [journalHistory, setJournalHistory] = useState([]);
+
+  // New Feature: Personalized Learning Paths
+  const [learningTopic, setLearningTopic] = useState('');
+  const [learningPath, setLearningPath] = '';
+  const [learningPathsHistory, setLearningPathsHistory] = useState([]);
+
+  // New Feature: Aura's Insights
+  const [auraInsight, setAuraInsight] = useState('');
+
+  const [loading, setLoading] = useState(false);
+
+  // Initialize Firebase and set up auth listener
+  useEffect(() => {
+    try {
+      const app = initializeApp(firebaseConfig);
+      const firestoreDb = getFirestore(app);
+      const firebaseAuth = getAuth(app);
+
+      setDb(firestoreDb);
+      setAuth(firebaseAuth);
+
+      const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+        if (user) {
+          setUserId(user.uid);
+        } else {
+          // Sign in anonymously if no user is authenticated
+          try {
+            if (initialAuthToken) {
+              await signInWithCustomToken(firebaseAuth, initialAuthToken);
+            } else {
+              await signInAnonymously(firebaseAuth);
+            }
+          } catch (error) {
+            console.error("Firebase anonymous sign-in failed:", error);
+          }
+        }
+        setIsAuthReady(true); // Auth state is ready
+      });
+
+      return () => unsubscribe();
+    } catch (error) {
+      console.error("Error initializing Firebase:", error);
+    }
+  }, []);
+
+  // Fetch all data when auth is ready and userId is available
+  useEffect(() => {
+    if (isAuthReady && userId && db) {
+      // Mood Entries
+      const moodCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/moodEntries`);
+      const unsubscribeMood = onSnapshot(query(moodCollectionRef, orderBy('timestamp', 'desc')), (snapshot) => {
+        const entries = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setMoodEntries(entries);
+      }, (error) => {
+        console.error("Error fetching mood entries:", error);
+      });
+
+      // Affirmations
+      const affirmationsCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/affirmations`);
+      const unsubscribeAffirmations = onSnapshot(query(affirmationsCollectionRef, orderBy('timestamp', 'desc')), (snapshot) => {
+        const afs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setAffirmations(afs);
+      }, (error) => {
+        console.error("Error fetching affirmations:", error);
+      });
+
+      // Chat History
+      const chatCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/chatHistory`);
+      const unsubscribeChat = onSnapshot(query(chatCollectionRef, orderBy('timestamp', 'asc')), (snapshot) => {
+        const history = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setChatHistory(history);
+      }, (error) => {
+        console.error("Error fetching chat history:", error);
+      });
+
+      // Consultation History
+      const consultationCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/consultationHistory`);
+      const unsubscribeConsultation = onSnapshot(query(consultationCollectionRef, orderBy('timestamp', 'desc')), (snapshot) => {
+        const history = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setConsultationHistory(history);
+      }, (error) => {
+        console.error("Error fetching consultation history:", error);
+      });
+
+      // Role-play History
+      const rolePlayCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/rolePlaySessions`);
+      const unsubscribeRolePlay = onSnapshot(query(rolePlayCollectionRef, orderBy('timestamp', 'desc')), (snapshot) => {
+        const history = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setRolePlayHistory(history);
+      }, (error) => {
+        console.error("Error fetching role-play history:", error);
+      });
+
+      // Goals
+      const goalsCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/goals`);
+      const unsubscribeGoals = onSnapshot(query(goalsCollectionRef, orderBy('timestamp', 'desc')), (snapshot) => {
+        const currentGoals = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setGoals(currentGoals);
+      }, (error) => {
+        console.error("Error fetching goals:", error);
+      });
+
+      // Journal History
+      const journalCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/journalEntries`);
+      const unsubscribeJournal = onSnapshot(query(journalCollectionRef, orderBy('timestamp', 'desc')), (snapshot) => {
+        const entries = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setJournalHistory(entries);
+      }, (error) => {
+        console.error("Error fetching journal entries:", error);
+      });
+
+      // Learning Paths History
+      const learningPathsCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/learningPaths`);
+      const unsubscribeLearningPaths = onSnapshot(query(learningPathsCollectionRef, orderBy('timestamp', 'desc')), (snapshot) => {
+        const paths = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setLearningPathsHistory(paths);
+      }, (error) => {
+        console.error("Error fetching learning paths:", error);
+      });
+
+
+      return () => {
+        unsubscribeMood();
+        unsubscribeAffirmations();
+        unsubscribeChat();
+        unsubscribeConsultation();
+        unsubscribeRolePlay();
+        unsubscribeGoals();
+        unsubscribeJournal();
+        unsubscribeLearningPaths();
+      };
+    }
+  }, [isAuthReady, userId, db]);
+
+  // Scroll to bottom of chat history when it updates
+  useEffect(() => {
+    chatMessagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatHistory]);
+
+  // Scroll to bottom of role-play conversation when it updates
+  useEffect(() => {
+    rolePlayMessagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [rolePlayConversation]);
+
+  // --- Core AI Interaction (Gemini API Call) ---
+  const callGeminiAPI = async (prompt, type = 'chat', currentConversation = [], multimodalData = null) => {
+    setLoading(true);
+    let contents = [];
+    let model = "gemini-2.5-flash-preview-05-20"; // Default to this for text
+
+    // Construct chat history for context
+    if (type === 'chat') {
+      // Define Lil A-Shanti's persona at the very beginning of the conversation context
+      contents.push({ role: "user", parts: [{ text: "You are Lil A-Shanti, a calm, empathetic, organized, and insightful personal well-being and productivity assistant. Always respond in a manner consistent with this persona, focusing on support and empowerment." }] });
+
+      // Append existing chat history, ensuring roles are correct
+      chatHistory.forEach(msg => {
+        contents.push({ role: msg.role === 'user' ? 'user' : 'model', parts: [{ text: msg.text }] });
+      });
+
+      // Append the current user's message
+      contents.push({ role: "user", parts: [{ text: prompt }] });
+    } else if (type === 'consultation') {
+      contents = [{ role: "user", parts: [{ text: `You are Lil A-Shanti, a calm, empathetic, organized, and insightful personal well-being and productivity assistant. Analyze the following situation and provide guidance: Situation: ${prompt}` }] }];
+    } else if (type === 'summarize_consultation') { // Explicitly handle summarize_consultation
+      contents = [{ role: "user", parts: [{ text: `Summarize the following guidance in one concise sentence: "${prompt}"` }] }];
+    }
+    else if (type === 'roleplay_start') {
+      contents = [{ role: "user", parts: [{ text: `You are now role-playing as a person with the following persona: "${rolePlayPersona}". The scenario is: "${rolePlayScenario}". Respond as this person to the user's first statement: "${prompt}"` }] }];
+    } else if (type === 'roleplay_continue') {
+      contents = [{ role: "user", parts: [{ text: `You are still role-playing as a person with the following persona: "${rolePlayPersona}". The ongoing scenario is: "${rolePlayScenario}". Continue the conversation based on this history: ${JSON.stringify(currentConversation)}. Your response to the latest user message: "${prompt}"` }] }];
+    } else if (type === 'roleplay_feedback') {
+      contents = [{ role: "user", parts: [{ text: `You are Lil A-Shanti, a supportive communication coach. Analyze the following role-play conversation and provide constructive feedback to the user on their communication, tone, and effectiveness. Focus on areas for improvement and strengths. Conversation: ${JSON.stringify(currentConversation)}` }] }];
+    } else if (type === 'affirmation_gen') {
+      contents = [{ role: "user", parts: [{ text: `Generate a short, positive, and encouraging affirmation. Make it gentle and uplifting, suitable for Lil A-Shanti's persona.` }] }];
+    } else if (type === 'proactive_checkin') {
+      contents = [{ role: "user", parts: [{ text: `You are Lil A-Shanti, a caring well-being assistant. Based on the user's recent mood entries: ${prompt}, craft a gentle, empathetic check-in message or suggestion. Focus on support and understanding.` }] }];
+    } else if (type === 'image_gen') {
+      model = "imagen-3.0-generate-002"; // This model is used for image generation
+      contents = [{ role: "user", parts: [{ text: `Generate an image based on this description: ${prompt}` }] }];
+      const response = await callGeminiImageAPI(model, contents); // Corrected to use callGeminiImageAPI
+      setLoading(false);
+      return response;
+    } else if (type === 'multimodal') {
+      if (multimodalData) {
+        contents = [{ role: "user", parts: [{ inlineData: { data: multimodalData, mimeType: multimodalFile.type } }, { text: prompt }] }];
+      } else {
+        contents = [{ role: "user", parts: [{ text: prompt }] }];
+      }
+    } else if (type === 'goal_steps') {
+      contents = [{ role: "user", parts: [{ text: `You are Lil A-Shanti, an organized productivity assistant. Break down the following goal into 3-5 actionable, sequential steps: "${prompt}"` }] }];
+    } else if (type === 'generate_meditation') {
+      contents = [{ role: "user", parts: [{ text: `You are Lil A-Shanti, a calm and soothing guide. Generate a short, guided meditation script based on this prompt: "${prompt}". Focus on peace and relaxation.` }] }];
+    } else if (type === 'summarize_knowledge') {
+      contents = [{ role: "user", parts: [{ text: `You are Lil A-Shanti, an insightful knowledge assistant. Summarize the following text concisely, highlighting key points: "${prompt}"` }] }];
+    } else if (type === 'ask_knowledge_question') {
+      // For knowledge questions, the 'prompt' is the question, and 'currentConversation[0].text' is the knowledge text
+      contents = [{ role: "user", parts: [{ text: `You are Lil A-Shanti, an insightful knowledge assistant. Based *only* on the provided text: "${currentConversation[0].text}", answer the following question: "${prompt}"` }] }];
+    } else if (type === 'journal_insight') {
+      contents = [{ role: "user", parts: [{ text: `You are Lil A-Shanti, an empathetic and insightful companion. Analyze the following journal entry: "${prompt}". Provide a gentle insight or a reflective question based on the content, focusing on self-awareness and well-being.` }] }];
+    } else if (type === 'learning_roadmap') {
+      contents = [{ role: "user", parts: [{ text: `You are Lil A-Shanti, an organized and encouraging learning coach. Create a personalized learning roadmap for the goal: "${prompt}". Include 3-5 key areas or steps, and suggest how to use Lil A-Shanti's features (e.g., Knowledge Library, Role-Play) to achieve it.` }] }];
+    } else if (type === 'aura_insight') {
+        const moodSummary = moodEntries.length > 0 ? `Recent moods: ${moodEntries.slice(0, 3).map(m => m.mood).join(', ')}` : 'No recent moods.';
+        const goalSummary = goals.length > 0 ? `Current goals: ${goals.map(g => g.name).join(', ')}` : 'No active goals.';
+        const consultationSummary = consultationHistory.length > 0 ? `Recent consultation topics: ${consultationHistory.slice(0, 2).map(c => c.input.substring(0, 50) + '...').join(', ')}` : 'No recent consultations.';
+        const journalSummary = journalHistory.length > 0 ? `Recent journal themes: ${journalHistory.slice(0, 2).map(j => j.entry.substring(0, 50) + '...').join(', ')}` : 'No recent journal entries.';
+        const learningSummary = learningPathsHistory.length > 0 ? `Recent learning topics: ${learningPathsHistory.slice(0, 2).map(l => l.topic).join(', ')}` : 'No recent learning paths.';
+
+        const fullContext = `User's recent data: ${moodSummary}. ${goalSummary}. ${consultationSummary}. ${journalSummary}. ${learningSummary}.`;
+        contents = [{ role: "user", parts: [{ text: `You are Aura, the user's Spiritual AI Guardian. Based on the following summary of the user's recent interactions and data, provide a holistic, insightful, and encouraging observation or piece of wisdom. Connect different aspects of their journey if possible. Focus on their growth and well-being. Data: ${fullContext}` }] }];
+    }
+
+
+    const payload = { contents: contents };
+    const apiKey = ""; // Canvas will provide this at runtime
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+    try {
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json();
+
+      if (result.candidates && result.candidates.length > 0 &&
+          result.candidates[0].content && result.candidates[0].content.parts &&
+          result.candidates[0].content.parts.length > 0) {
+        const text = result.candidates[0].content.parts[0].text;
+        return text;
+      } else {
+        console.error("Unexpected API response structure:", result);
+        return "I'm sorry, I couldn't generate a response right now. The AI model might have had an issue.";
+      }
+    } catch (error) {
+      console.error("Error calling Gemini API:", error);
+      return "I encountered an issue connecting with my thoughts. Please try again later.";
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // --- Image Generation API call (specialized) ---
+  const callGeminiImageAPI = async (model, contents) => {
+    // For imagen-3.0-generate-002, the API uses a 'predict' method and different payload structure
+    const payload = { instances: { prompt: contents[0].parts[0].text }, parameters: { "sampleCount": 1} };
+    const apiKey = ""; // Canvas will provide this at runtime
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:predict?key=${apiKey}`;
+
+    try {
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        const errorDetail = await response.text();
+        console.error("Image generation API error (not OK):", response.status, errorDetail);
+        setMultimodalError(`Image generation failed (Status: ${response.status}). This often means the Image Generation API needs to be enabled in your Google Cloud project, or an explicit API key is required for this model. For troubleshooting, please check your project's API settings.`);
+        return null;
+      }
+
+      const result = await response.json();
+
+      if (result.predictions && result.predictions.length > 0 && result.predictions[0].bytesBase64Encoded) {
+        const imageUrl = `data:image/png;base64,${result.predictions[0].bytesBase64Encoded}`;
+        return imageUrl;
+      } else {
+        console.error("Image generation failed or unexpected response:", result);
+        setMultimodalError("Image generation failed. Unexpected response from the AI model.");
+        return null;
+      }
+    } catch (error) {
+      console.error("Error calling Gemini Image API:", error);
+      setMultimodalError("I encountered an issue connecting with the image generation service. Please try again later.");
+      return null;
+    }
+  };
+
+  // --- Speech-to-Text (STT) ---
+  const startListening = (targetInputSetter) => {
+    if (!('webkitSpeechRecognition' in window)) {
+      setLilAShantiResponse("I'm sorry, your browser doesn't support speech recognition. Please try typing your message.");
+      return;
+    }
+
+    const SpeechRecognition = window.webkitSpeechRecognition;
+    recognitionRef.current = new SpeechRecognition();
+    recognitionRef.current.continuous = false; // Only get one result per utterance
+    recognitionRef.current.interimResults = false; // Only final results
+    recognitionRef.current.lang = 'en-US';
+
+    recognitionRef.current.onstart = () => {
+      setIsListening(true);
+      setLilAShantiResponse("Listening... Please speak clearly.");
+    };
+
+    recognitionRef.current.onresult = (event) => {
+      const transcript = event.results[0][0].transcript;
+      targetInputSetter(transcript); // Set the recognized text to the specified input field
+      setLilAShantiResponse("I heard: " + transcript); // Provide feedback
+    };
+
+    recognitionRef.current.onerror = (event) => {
+      console.error("Speech recognition error:", event.error);
+      setIsListening(false);
+      setLilAShantiResponse("I had trouble hearing you. Could you please try again or type your message?");
+    };
+
+    recognitionRef.current.onend = () => {
+      setIsListening(false);
+      // No automatic send here, user clicks send or enter
+    };
+
+    recognitionRef.current.start();
+  };
+
+  const stopListening = () => {
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+      setLilAShantiResponse("Stopped listening.");
+    }
+  };
+
+  // --- Text-to-Speech (TTS) ---
+  const speakLilAShantiResponse = async (textToSpeak) => {
+    setLoading(true);
+    try {
+      const payload = {
+        contents: [{
+          parts: [{ text: textToSpeak }]
+        }],
+        generationConfig: {
+          responseModalities: ["AUDIO"],
+          speechConfig: {
+            multiSpeakerVoiceConfig: {
+              speakerVoiceConfigs: [
+                { speaker: "Lil A-Shanti", voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } } // Lil A-Shanti's voice
+              ]
+            }
+          }
+        },
+        model: "gemini-2.5-flash-preview-tts"
+      };
+      // For TTS (gemini-2.5-flash-preview-tts), a 401 Unauthorized error often indicates that the Text-to-Speech API
+      // is not enabled in the Google Cloud project associated with the injected API key,
+      // or that the key itself does not have the necessary permissions.
+      const apiKey = ""; // Canvas will provide this at runtime for some models.
+      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`;
+
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      // Check if the response was successful (status 2xx)
+      if (!response.ok) {
+        const errorText = await response.text(); // Get raw error text
+        console.error("TTS API error response (not OK):", response.status, errorText);
+        setLilAShantiResponse(`I encountered an API error generating audio (Status: ${response.status}). This often means the Text-to-Speech API needs to be enabled in your Google Cloud project, or an explicit API key is required for this model. For troubleshooting, please check your project's API settings.`);
+        return; // Exit function
+      }
+
+      const result = await response.json();
+
+      const part = result?.candidates?.[0]?.content?.parts?.[0];
+      const audioData = part?.inlineData?.data;
+      const mimeType = part?.inlineData?.mimeType;
+
+      if (audioData && mimeType && mimeType.startsWith("audio/L16")) {
+        const sampleRateMatch = mimeType.match(/rate=(\d+)/);
+        const sampleRate = sampleRateMatch ? parseInt(sampleRateMatch[1], 10) : 16000; // Default to 16kHz
+
+        const pcmData = base64ToArrayBuffer(audioData);
+        const pcm16 = new Int16Array(pcmData);
+        const wavBlob = pcmToWav(pcm16, sampleRate);
+        const audioUrl = URL.createObjectURL(wavBlob);
+
+        const audio = new Audio(audioUrl);
+        audio.play();
+      } else {
+        console.error("TTS audio generation failed or unsupported format:", result);
+        setLilAShantiResponse("I couldn't generate the audio for my response right now.");
+      }
+    } catch (error) {
+      console.error("Error playing TTS:", error);
+      setLilAShantiResponse("I encountered an issue with the audio. Please try again later.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // --- Handlers for different functionalities ---
+
+  // Mood Entry
+  const addMoodEntry = async () => {
+    if (!db || !userId || !currentMood.trim()) {
+      setLilAShantiResponse("Please tell me how you're feeling before I can record it.");
+      return;
+    }
+    setLoading(true);
+    try {
+      const moodCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/moodEntries`);
+      await addDoc(moodCollectionRef, {
+        mood: currentMood,
+        timestamp: new Date().toISOString(),
+      });
+      setCurrentMood('');
+      const responseText = "Thank you for sharing. I've noted your mood. Remember, it's okay to feel whatever you're feeling.";
+      setLilAShantiResponse(responseText);
+      speakLilAShantiResponse(responseText);
+    } catch (e) {
+      console.error("Error adding mood entry: ", e);
+      setLilAShantiResponse("I'm sorry, I couldn't record your mood right now. Please try again later.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Proactive Check-in
+  const handleProactiveCheckin = async () => {
+    if (!moodEntries.length) {
+      setLilAShantiResponse("I don't have enough mood data to provide a personalized check-in yet. Please log some moods first!");
+      return;
+    }
+    setLoading(true);
+    const recentMoods = moodEntries.slice(0, 5).map(entry => `${entry.mood} on ${new Date(entry.timestamp).toLocaleDateString()}`).join(', ');
+    const prompt = `Based on your recent mood entries: ${recentMoods}, what's on your mind today? Or would you like a moment of calm?`;
+    const checkinResponse = await callGeminiAPI(prompt, 'proactive_checkin');
+    setLilAShantiResponse(checkinResponse);
+    speakLilAShantiResponse(checkinResponse);
+    setLoading(false);
+  };
+
+
+  // Affirmations
+  const addAffirmation = async () => {
+    if (!db || !userId || !newAffirmation.trim()) {
+      setLilAShantiResponse("Please type an affirmation before I can add it.");
+      return;
+    }
+    setLoading(true);
+    try {
+      const affirmationsCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/affirmations`);
+      await addDoc(affirmationsCollectionRef, {
+        text: newAffirmation,
+        timestamp: new Date().toISOString(),
+      });
+      setNewAffirmation('');
+      const responseText = "That's a wonderful affirmation! I've added it to your collection. Keep shining!";
+      setLilAShantiResponse(responseText);
+      speakLilAShantiResponse(responseText);
+    } catch (e) {
+      console.error("Error adding affirmation: ", e);
+      setLilAShantiResponse("I'm sorry, I couldn't add your affirmation right now. Please try again later.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const generateAffirmation = async () => {
+    setLoading(true);
+    setLilAShantiResponse("Generating a positive affirmation for you...");
+    const generatedText = await callGeminiAPI("", 'affirmation_gen'); // Prompt handled internally by callGeminiAPI for this type
+    setNewAffirmation(generatedText);
+    const responseText = "Here's an affirmation I thought you might like. Feel free to add it!";
+    setLilAShantiResponse(responseText);
+    speakLilAShantiResponse(responseText);
+    setLoading(false);
+  };
+
+  // Chat Interaction
+  const handleChatSubmit = async () => {
+    if (!db || !userId || !currentChatMessage.trim()) {
+      setLilAShantiResponse("Please type or speak something for me to respond to.");
+      return;
+    }
+    const userMessage = currentChatMessage.trim();
+    setCurrentChatMessage(''); // Clear input immediately
+
+    // Add user message to local state and Firestore
+    const newChatHistory = [...chatHistory, { role: 'user', text: userMessage, timestamp: new Date().toISOString() }];
+    setChatHistory(newChatHistory);
+    await addDoc(collection(db, `artifacts/${appId}/users/${userId}/chatHistory`), {
+      role: 'user',
+      text: userMessage,
+      timestamp: new Date().toISOString(),
+    });
+
+    setLoading(true);
+    setLilAShantiResponse("Lil A-Shanti is thinking...");
+
+    const lilAShantiTextResponse = await callGeminiAPI(userMessage, 'chat');
+
+    // Add Lil A-Shanti's response to local state and Firestore
+    const updatedChatHistory = [...newChatHistory, { role: 'lilashanti', text: lilAShantiTextResponse, timestamp: new Date().toISOString() }];
+    setChatHistory(updatedChatHistory);
+    await addDoc(collection(db, `artifacts/${appId}/users/${userId}/chatHistory`), {
+      role: 'lilashanti',
+      text: lilAShantiTextResponse,
+      timestamp: new Date().toISOString(),
+    });
+
+    setLilAShantiResponse(lilAShantiTextResponse);
+    speakLilAShantiResponse(lilAShantiTextResponse);
+    setLoading(false);
+  };
+
+  // Consultation Mode
+  const handleConsultationSubmit = async () => {
+    if (!db || !userId || !consultationInput.trim()) {
+      setConsultationResponse("Please describe the situation you'd like guidance on.");
+      return;
+    }
+    const situation = consultationInput.trim();
+    setConsultationInput(''); // Clear input immediately
+
+    setLoading(true);
+    setConsultationResponse("Lil A-Shanti is analyzing the situation...");
+
+    const guidance = await callGeminiAPI(situation, 'consultation');
+
+    // Generate summary for consultation
+    const summaryPrompt = guidance; // Pass the full guidance to the summarizer
+    const summary = await callGeminiAPI(summaryPrompt, 'summarize_consultation'); // Use the new explicit type
+
+    // Add to consultation history
+    const newConsultationEntry = {
+      input: situation,
+      response: guidance,
+      summary: summary, // Store the summary
+      timestamp: new Date().toISOString(),
+    };
+    await addDoc(collection(db, `artifacts/${appId}/users/${userId}/consultationHistory`), newConsultationEntry);
+
+    setConsultationResponse(guidance);
+    speakLilAShantiResponse(guidance);
+    setLoading(false);
+  };
+
+  // Role-play Mode
+  const startRolePlay = async () => {
+    if (!db || !userId || !rolePlayScenario.trim() || !rolePlayPersona.trim()) {
+      setLilAShantiResponse("Please provide a scenario and a persona for the role-play.");
+      return;
+    }
+    setRolePlayConversation([]); // Clear previous conversation
+    setRolePlayFeedback('');
+    setLoading(true);
+    setLilAShantiResponse("Starting role-play...");
+
+    const firstResponse = await callGeminiAPI("Hello, let's begin.", 'roleplay_start', []); // Initial user message for role-play
+    const newConversation = [{ role: 'lilashanti_rp', text: firstResponse, timestamp: new Date().toISOString() }];
+    setRolePlayConversation(newConversation);
+    setLilAShantiResponse("Role-play started. I am now " + rolePlayPersona + ". What would you like to say first?");
+    speakLilAShantiResponse("Role-play started. I am now " + rolePlayPersona + ". What would you like to say first?");
+    setLoading(false);
+  };
+
+  const handleRolePlayMessage = async () => {
+    if (!db || !userId || !currentRolePlayMessage.trim()) return;
+
+    const userMsg = currentRolePlayMessage.trim();
+    setCurrentRolePlayMessage('');
+
+    const updatedConversation = [...rolePlayConversation, { role: 'user', text: userMsg, timestamp: new Date().toISOString() }];
+    setRolePlayConversation(updatedConversation);
+
+    setLoading(true);
+    setLilAShantiResponse("Lil A-Shanti (as " + rolePlayPersona + ") is thinking...");
+
+    const rpResponse = await callGeminiAPI(userMsg, 'roleplay_continue', updatedConversation);
+
+    const finalConversation = [...updatedConversation, { role: 'lilashanti_rp', text: rpResponse, timestamp: new Date().toISOString() }];
+    setRolePlayConversation(finalConversation);
+
+    setLilAShantiResponse("Lil A-Shanti (as " + rolePlayPersona + ") responded.");
+    speakLilAShantiResponse(rpResponse);
+    setLoading(false);
+  };
+
+  const getRolePlayFeedback = async () => {
+    if (!db || !userId || !rolePlayConversation.length) {
+      setLilAShantiResponse("There's no role-play conversation to get feedback on yet.");
+      return;
+    }
+    setLoading(true);
+    setLilAShantiResponse("Lil A-Shanti is analyzing the role-play and preparing feedback...");
+
+    const feedback = await callGeminiAPI(JSON.stringify(rolePlayConversation), 'roleplay_feedback');
+    setRolePlayFeedback(feedback);
+    setLilAShantiResponse("Here's the feedback on your role-play session.");
+    speakLilAShantiResponse("Here's the feedback on your role-play session.");
+
+    // Save the completed role-play session to history
+    await addDoc(collection(db, `artifacts/${appId}/users/${userId}/rolePlaySessions`), {
+      scenarioDescription: rolePlayScenario,
+      otherPersonPersona: rolePlayPersona,
+      conversationLog: rolePlayConversation,
+      feedback: feedback,
+      timestamp: new Date().toISOString(),
+    });
+
+    setLoading(false);
+  };
+
+  // --- New Handlers for Multimodality and Image Generation ---
+
+  const handleImageGeneration = async () => {
+    if (!imagePrompt.trim()) {
+      setLilAShantiResponse("Please provide a prompt to generate an image.");
+      return;
+    }
+    setLoading(true);
+    setLilAShantiResponse("Lil A-Shanti is creating your image...");
+    const imageUrl = await callGeminiImageAPI("imagen-3.0-generate-002", [{ parts: [{ text: imagePrompt }] }]);
+    if (imageUrl) {
+      setGeneratedImageUrl(imageUrl);
+      setLilAShantiResponse("Your image has been created!");
+    } else {
+      setLilAShantiResponse("I'm sorry, I couldn't create an image with that prompt.");
+    }
+    setLoading(false);
+  };
+
+  const handleMultimodalSubmit = async () => {
+    setMultimodalError(''); // Clear any previous error
+    if (!multimodalFile && !multimodalPrompt.trim()) {
+      setMultimodalError("Please upload an image and/or enter a prompt.");
+      return;
+    }
+
+    let fileData = null;
+    if (multimodalFile) {
+        const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+        const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp']; // Only images for now
+
+        if (multimodalFile.size > MAX_FILE_SIZE) {
+            setMultimodalError(`File size exceeds the 5MB limit. Your file is ${Math.round(multimodalFile.size / 1024 / 1024)}MB.`);
+            return;
+        }
+
+        if (!allowedTypes.includes(multimodalFile.type)) {
+            setMultimodalError("Unsupported file type. Please upload a JPG, PNG, GIF, or WEBP image.");
+            return;
+        }
+
+        fileData = await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result.split(',')[1]);
+            reader.readAsDataURL(multimodalFile);
+        });
+    }
+
+    setLoading(true);
+    setLilAShantiResponse("Lil A-Shanti is processing your input...");
+
+    const multimodalResponse = await callGeminiAPI(multimodalPrompt, 'multimodal', [], fileData);
+    setLilAShantiResponse(multimodalResponse);
+    speakLilAShantiResponse(multimodalResponse);
+    setLoading(false);
+    setMultimodalPrompt('');
+    setMultimodalFile(null); // Clear file input
+  };
+
+  const handleFileChange = (event) => {
+    const file = event.target.files[0];
+    if (file) {
+      setMultimodalFile(file);
+      setMultimodalError(''); // Clear error on new file selection
+    } else {
+      setMultimodalFile(null);
+    }
+  };
+
+  // --- New Handlers for Goal Setting ---
+  const addGoal = async () => {
+    if (!db || !userId || !newGoalName.trim()) {
+      setLilAShantiResponse("Please enter a goal name.");
+      return;
+    }
+    setLoading(true);
+    setLilAShantiResponse("Lil A-Shanti is helping you plan your goal...");
+    const stepsText = await callGeminiAPI(newGoalName, 'goal_steps');
+    const steps = stepsText.split('\n').filter(s => s.trim() !== '').map((s, index) => ({
+      id: `step-${index}-${Date.now()}`,
+      description: s.replace(/^\d+\.\s*/, '').trim(), // Remove numbering
+      completed: false
+    }));
+
+    try {
+      await addDoc(collection(db, `artifacts/${appId}/users/${userId}/goals`), {
+        name: newGoalName,
+        steps: steps,
+        timestamp: new Date().toISOString(),
+      });
+      setNewGoalName('');
+      const responseText = `Great goal! I've helped you break down "${newGoalName}" into steps. You can now track your progress.`;
+      setLilAShantiResponse(responseText);
+      speakLilAShantiResponse(responseText);
+    } catch (e) {
+      console.error("Error adding goal: ", e);
+      setLilAShantiResponse("I'm sorry, I couldn't add your goal right now.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const toggleGoalStep = async (goalId, stepId) => {
+    if (!db || !userId) return;
+    const goalRef = doc(db, `artifacts/${appId}/users/${userId}/goals`, goalId);
+    const goal = goals.find(g => g.id === goalId);
+    if (goal) {
+      const updatedSteps = goal.steps.map(step =>
+        step.id === stepId ? { ...step, completed: !step.completed } : step
+      );
+      await updateDoc(goalRef, { steps: updatedSteps });
+      setLilAShantiResponse("Progress updated! Keep going!");
+    }
+  };
+
+  // --- New Handlers for Inner Garden (Guided Meditations) ---
+  const generateMeditation = async () => {
+    if (!meditationPrompt.trim()) {
+      setLilAShantiResponse("Please provide a prompt for your meditation.");
+      return;
+    }
+    setLoading(true);
+    setLilAShantiResponse("Lil A-Shanti is crafting a meditation for you...");
+    const meditationScript = await callGeminiAPI(meditationPrompt, 'generate_meditation');
+    setGeneratedMeditation(meditationScript);
+    const responseText = "Here is a guided meditation for you. Let me know when you're ready to begin.";
+    setLilAShantiResponse(responseText);
+    speakLilAShantiResponse(responseText);
+    setLoading(false);
+  };
+
+  // --- New Handlers for Knowledge Library ---
+  const summarizeKnowledge = async () => {
+    if (!knowledgeInput.trim()) {
+      setLilAShantiResponse("Please paste some text to summarize.");
+      return;
+    }
+    setLoading(true);
+    setLilAShantiResponse("Lil A-Shanti is summarizing the text...");
+    const summary = await callGeminiAPI(knowledgeInput, 'summarize_knowledge');
+    setKnowledgeSummary(summary);
+    setLilAShantiResponse("Here's a concise summary of the text you provided.");
+    speakLilAShantiResponse("Here's a concise summary of the text you provided.");
+    setLoading(false);
+  };
+
+  const askKnowledgeQuestion = async () => {
+    if (!knowledgeInput.trim() || !knowledgeQuestion.trim()) {
+      setLilAShantiResponse("Please provide text and a question to get an answer.");
+      return;
+    }
+    setLoading(true);
+    setLilAShantiResponse("Lil A-Shanti is finding the answer...");
+    // Pass knowledgeInput directly as the text context for the question
+    const answer = await callGeminiAPI(knowledgeQuestion, 'ask_knowledge_question', [{ text: knowledgeInput }]);
+    setKnowledgeAnswer(answer);
+    setLilAShantiResponse("Here's the answer based on the text you provided.");
+    speakLilAShantiResponse("Here's the answer based on the text you provided.");
+    setLoading(false);
+  };
+
+  // --- New Handlers for Daily Reflection Journal ---
+  const saveJournalEntry = async () => {
+    if (!db || !userId || !journalEntry.trim()) {
+      setLilAShantiResponse("Please write something in your journal before saving.");
+      return;
+    }
+    setLoading(true);
+    try {
+      console.log("Attempting to save journal entry...");
+      console.log("Firestore DB instance:", db);
+      console.log("Current User ID:", userId);
+
+      // Ensure db and userId are available before proceeding
+      if (!db || !userId) {
+        const errorMsg = "Firestore DB or User ID not available. Cannot save journal entry. This could be due to a slow connection or authentication issue.";
+        console.error(errorMsg);
+        setLilAShantiResponse(errorMsg + " Please wait a moment and try again.");
+        setLoading(false);
+        return;
+      }
+
+      const journalCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/journalEntries`);
+      console.log("Journal Collection Reference Path:", journalCollectionRef.path); // Log the full path
+
+      await addDoc(journalCollectionRef, {
+        entry: journalEntry,
+        timestamp: new Date().toISOString(),
+      });
+      setJournalEntry('');
+      const responseText = "Your thoughts have been safely recorded. Reflecting is a powerful step towards clarity.";
+      setLilAShantiResponse(responseText);
+      speakLilAShantiResponse(responseText);
+      console.log("Journal entry saved successfully!");
+    } catch (e) {
+      console.error("Error saving journal entry to Firestore: ", e);
+      setLilAShantiResponse(`I'm sorry, I couldn't save your journal entry right now. Error details: "${e.message}". This might be a temporary network issue or a problem connecting to the database. Please try again later, and if the issue persists, check the browser console for more details.`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const getJournalInsight = async (entryText) => {
+    setLoading(true);
+    setLilAShantiResponse("Lil A-Shanti is reflecting on your entry...");
+    const insight = await callGeminiAPI(entryText, 'journal_insight');
+    setLilAShantiResponse(insight);
+    speakLilAShantiResponse(insight);
+    setLoading(false);
+  };
+
+  // --- New Handlers for Personalized Learning Paths ---
+  const generateLearningPath = async () => {
+    if (!learningTopic.trim()) {
+      setLilAShantiResponse("Please enter a topic or skill you want to learn.");
+      return;
+    }
+    setLoading(true);
+    setLilAShantiResponse("Lil A-Shanti is crafting your personalized learning path...");
+    const path = await callGeminiAPI(learningTopic, 'learning_roadmap');
+    setLearningPath(path);
+    const responseText = `Here's a learning path for "${learningTopic}". I'm here to support you every step of the way!`;
+    setLilAShantiResponse(responseText);
+    speakLilAShantiResponse(responseText);
+
+    try {
+      await addDoc(collection(db, `artifacts/${appId}/users/${userId}/learningPaths`), {
+        topic: learningTopic,
+        path: path,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (e) {
+      console.error("Error saving learning path:", e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // --- New Handlers for Aura's Insights ---
+  const getAuraInsight = async () => {
+    setLoading(true);
+    setLilAShantiResponse("Aura is gathering insights from your journey...");
+    const insight = await callGeminiAPI('', 'aura_insight'); // Prompt is constructed within callGeminiAPI for this type
+    setAuraInsight(insight);
+    setLilAShantiResponse("Here is a personalized insight from Aura.");
+    speakLilAShantiResponse(insight);
+    setLoading(false);
+  };
+
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-purple-100 to-indigo-200 flex items-center justify-center p-4 font-sans">
+      <script src="https://cdn.tailwindcss.com"></script>
+      <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet" />
+
+      <style>
+        {`
+        body { font-family: 'Inter', sans-serif; }
+        .scrollable-content {
+          max-height: 200px; /* Limit height for scrollable lists */
+          overflow-y: auto;
+          -ms-overflow-style: none; /* IE and Edge */
+          scrollbar-width: none; /* Firefox */
+        }
+        .scrollable-content::-webkit-scrollbar {
+          display: none; /* Chrome, Safari, Opera*/
+        }
+        .chat-container {
+          max-height: 300px;
+          overflow-y: auto;
+          -ms-overflow-style: none;
+          scrollbar-width: none;
+        }
+        .chat-container::-webkit-scrollbar {
+          display: none;
+        }
+        .user-message {
+          background-color: #e0f2fe; /* Light blue */
+          align-self: flex-end;
+          border-bottom-right-radius: 0;
+        }
+        .lilashanti-message {
+          background-color: #ede9fe; /* Light purple */
+          align-self: flex-start;
+          border-bottom-left-radius: 0;
+        }
+        .lilashanti-rp-message {
+          background-color: #d1fae5; /* Light green for role-play persona */
+          align-self: flex-start;
+          border-bottom-left-radius: 0;
+        }
+        `}
+      </style>
+
+      <div className="bg-white rounded-3xl shadow-2xl p-8 w-full max-w-2xl border border-purple-300">
+        <h1 className="text-4xl font-bold text-center text-purple-700 mb-6">
+          Lil A-Shanti
+        </h1>
+        <p className="text-center text-gray-600 mb-8">
+          Your personal well-being and productivity assistant.
+        </p>
+
+        {/* User ID Display */}
+        {userId && (
+          <div className="text-sm text-center text-gray-500 mb-4 p-2 bg-purple-50 rounded-lg">
+            Your unique ID: <span className="font-mono text-purple-600 break-all">{userId}</span>
+          </div>
+        )}
+
+        {/* Lil A-Shanti's Current Response Area */}
+        <div className="bg-purple-50 p-4 rounded-xl mb-6 text-purple-800 text-lg text-center border border-purple-200">
+          {loading ? (
+            <div className="flex items-center justify-center">
+              <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-purple-500 mr-3"></div>
+              <span>Lil A-Shanti is thinking...</span>
+            </div>
+          ) : (
+            lilAShantiResponse
+          )}
+        </div>
+
+        {/* Main Chat Interface */}
+        <div className="mb-8 p-4 bg-gray-50 rounded-xl shadow-inner border border-gray-200">
+          <h2 className="text-2xl font-semibold text-purple-600 mb-4">Chat with Lil A-Shanti</h2>
+          <div className="chat-container flex flex-col space-y-3 p-4 bg-white rounded-lg border border-gray-300 mb-4">
+            {chatHistory.map((msg, index) => (
+              <div
+                key={msg.id || index}
+                className={`p-3 rounded-lg max-w-[80%] shadow-sm ${
+                  msg.role === 'user' ? 'user-message ml-auto' : 'lilashanti-message mr-auto'
+                }`}
+              >
+                <p className="text-sm">{msg.text}</p>
+                <span className="text-xs text-gray-500 mt-1 block">
+                  {new Date(msg.timestamp).toLocaleTimeString()}
+                </span>
+              </div>
+            ))}
+            <div ref={chatMessagesEndRef} /> {/* For auto-scrolling */}
+          </div>
+          <div className="flex items-center">
+            <input
+              type="text"
+              className="flex-grow p-3 border border-purple-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-400"
+              placeholder="Type your message..."
+              value={currentChatMessage}
+              onChange={(e) => setCurrentChatMessage(e.target.value)}
+              onKeyPress={(e) => { if (e.key === 'Enter') handleChatSubmit(); }}
+              disabled={loading}
+            />
+            <button
+              onClick={handleChatSubmit}
+              className="ml-3 px-5 py-3 bg-purple-600 text-white rounded-xl hover:bg-purple-700 transition-colors shadow-md"
+              disabled={loading}
+            >
+              Send
+            </button>
+            <button
+              onClick={() => isListening ? stopListening() : startListening(setCurrentChatMessage)}
+              className={`ml-3 px-4 py-3 rounded-xl transition-colors shadow-md ${
+                isListening ? 'bg-red-500 hover:bg-red-600' : 'bg-blue-500 hover:bg-blue-600'
+              } text-white`}
+              disabled={loading}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-6 h-6">
+                {isListening ? (
+                  <path d="M18.707 6.707a1 1 0 00-1.414-1.414L12 10.586 6.707 5.293a1 1 0 00-1.414 1.414L10.586 12l-5.293 5.293a1 1 0 001.414 1.414L12 13.414l5.293 5.293a1 1 0 001.414-1.414L13.414 12l5.293-5.293z" />
+                ) : (
+                  <path d="M8.707 15.707a1 1 0 001.414 0L12 13.414l1.879 1.879a1 1 0 001.414-1.414L13.414 12l1.879-1.879a1 1 0 00-1.414-1.414L12 10.586l-1.879-1.879a1 1 0 00-1.414 1.414L10.586 12l-1.879 1.879a1 1 0 000 1.414zM12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm0 18c-4.411 0-8-3.589-8-8s3.589-8 8-8 8 3.589 8 8-3.589 8-8 8z" />
+                )}
+              </svg>
+            </button>
+          </div>
+        </div>
+        
+        {/* Multimodal Input Section */}
+        <div className="mb-8 p-4 bg-gray-50 rounded-xl shadow-inner border border-gray-200">
+          <h2 className="text-2xl font-semibold text-purple-600 mb-4">Multimodal Input</h2>
+          <p className="text-gray-700 mb-3">
+            Upload an **image** (JPG, PNG, GIF, WEBP, max 5MB) and ask Lil A-Shanti to analyze it.
+          </p>
+          <div className="flex items-center mb-4">
+            <input
+              type="file"
+              accept="image/jpeg,image/png,image/gif,image/webp"
+              onChange={handleFileChange}
+              className="block w-full text-sm text-gray-500
+                file:mr-4 file:py-2 file:px-4
+                file:rounded-full file:border-0
+                file:text-sm file:font-semibold
+                file:bg-purple-50 file:text-purple-700
+                hover:file:bg-purple-100"
+            />
+          </div>
+          {multimodalFile && (
+            <div className="bg-purple-50 p-2 rounded-lg text-sm text-purple-800 mb-3">
+              File selected: <span className="font-medium">{multimodalFile.name}</span>
+            </div>
+          )}
+          <textarea
+            className="w-full p-3 border border-purple-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-400 mb-4"
+            placeholder="Ask a question about the image you uploaded (e.g., 'What is this a picture of?', 'Describe the main elements in this image')..."
+            value={multimodalPrompt}
+            onChange={(e) => setMultimodalPrompt(e.target.value)}
+            disabled={loading}
+          ></textarea>
+          {multimodalError && (
+            <div className="text-sm text-red-600 bg-red-100 p-2 rounded-lg mb-4">
+              {multimodalError}
+            </div>
+          )}
+          <button
+            onClick={handleMultimodalSubmit}
+            className="w-full px-5 py-3 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 transition-colors shadow-md"
+            disabled={loading || (!multimodalFile && !multimodalPrompt.trim())}
+          >
+            Send to Lil A-Shanti
+          </button>
+        </div>
+
+        {/* Image Generation Section */}
+        <div className="mb-8 p-4 bg-gray-50 rounded-xl shadow-inner border border-gray-200">
+          <h2 className="text-2xl font-semibold text-purple-600 mb-4">Image Generation</h2>
+          <p className="text-gray-700 mb-3">
+            Describe the image you want Lil A-Shanti to create.
+          </p>
+          <input
+            type="text"
+            className="w-full p-3 border border-purple-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-400 mb-4"
+            placeholder="e.g., 'A serene digital painting of a panda meditating in a bamboo forest.'"
+            value={imagePrompt}
+            onChange={(e) => setImagePrompt(e.target.value)}
+            disabled={loading}
+          />
+          <button
+            onClick={handleImageGeneration}
+            className="w-full px-5 py-3 bg-green-600 text-white rounded-xl hover:bg-green-700 transition-colors shadow-md"
+            disabled={loading}
+          >
+            Generate Image
+          </button>
+          {generatedImageUrl && (
+            <div className="mt-4 p-4 bg-green-50 rounded-xl text-center border border-green-200">
+              <h3 className="font-semibold mb-2">Generated Image:</h3>
+              <img src={generatedImageUrl} alt="Generated by Lil A-Shanti" className="mx-auto rounded-lg max-w-full" />
+            </div>
+          )}
+        </div>
+
+        {/* Goal Setting & Tracking Section */}
+        <div className="mb-8 p-4 bg-gray-50 rounded-xl shadow-inner border border-gray-200">
+          <h2 className="text-2xl font-semibold text-purple-600 mb-4">Goal Setting & Tracking</h2>
+          <p className="text-gray-700 mb-3">
+            Set a new goal and let Lil A-Shanti help you break it down into steps.
+          </p>
+          <div className="flex items-center mb-4">
+            <input
+              type="text"
+              className="flex-grow p-3 border border-purple-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-400"
+              placeholder="e.g., 'Learn to play the guitar'"
+              value={newGoalName}
+              onChange={(e) => setNewGoalName(e.target.value)}
+              onKeyPress={(e) => { if (e.key === 'Enter') addGoal(); }}
+              disabled={loading}
+            />
+            <button
+              onClick={addGoal}
+              className="ml-3 px-5 py-3 bg-purple-600 text-white rounded-xl hover:bg-purple-700 transition-colors shadow-md"
+              disabled={loading}
+            >
+              Set Goal & Get Steps
+            </button>
+          </div>
+          <div className="scrollable-content bg-purple-50 p-3 rounded-xl border border-purple-200">
+            <h3 className="text-lg font-medium text-purple-700 mb-2">Your Goals:</h3>
+            {goals.length === 0 ? (
+              <p className="text-gray-500 italic">No goals set yet. Let's start a new one!</p>
+            ) : (
+              <ul>
+                {goals.map((goal) => (
+                  <li key={goal.id} className="text-gray-700 text-sm py-2 border-b border-purple-100 last:border-b-0">
+                    <p className="font-semibold text-base text-purple-800 mb-1">{goal.name}</p>
+                    <ul className="list-disc list-inside ml-4">
+                      {goal.steps && goal.steps.map((step) => (
+                        <li key={step.id} className={`flex items-center ${step.completed ? 'line-through text-gray-500' : ''}`}>
+                          <input
+                            type="checkbox"
+                            checked={step.completed}
+                            onChange={() => toggleGoalStep(goal.id, step.id)}
+                            className="mr-2 h-4 w-4 text-purple-600 rounded focus:ring-purple-500"
+                          />
+                          {step.description}
+                        </li>
+                      ))}
+                    </ul>
+                    <span className="text-xs text-gray-500 mt-1 block">
+                      Set on: {new Date(goal.timestamp).toLocaleDateString()}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+
+        {/* The Inner Garden Section */}
+        <div className="mb-8 p-4 bg-gray-50 rounded-xl shadow-inner border border-gray-200">
+          <h2 className="text-2xl font-semibold text-purple-600 mb-4">The Inner Garden: Guided Meditations</h2>
+          <p className="text-gray-700 mb-3">
+            Generate a personalized guided meditation to find calm and focus.
+          </p>
+          <input
+            type="text"
+            className="w-full p-3 border border-purple-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-400 mb-4"
+            placeholder="e.g., 'A meditation for deep sleep' or 'A quick energizing meditation'"
+            value={meditationPrompt}
+            onChange={(e) => setMeditationPrompt(e.target.value)}
+            disabled={loading}
+          />
+          <button
+            onClick={generateMeditation}
+            className="w-full px-5 py-3 bg-teal-600 text-white rounded-xl hover:bg-teal-700 transition-colors shadow-md mb-4"
+            disabled={loading}
+          >
+            Generate Guided Meditation
+          </button>
+          {generatedMeditation && (
+            <div className="mt-4 p-4 bg-teal-50 rounded-xl text-teal-800 border border-teal-200">
+              <h3 className="font-semibold mb-2">Your Meditation Script:</h3>
+              <div className="scrollable-content mb-3">
+                <p className="whitespace-pre-wrap">{generatedMeditation}</p>
+              </div>
+              <button
+                onClick={() => speakLilAShantiResponse(generatedMeditation)}
+                className="w-full px-5 py-3 bg-green-500 text-white rounded-xl hover:bg-green-600 transition-colors shadow-md"
+                disabled={loading}
+              >
+                Speak Meditation
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* Knowledge Library Section */}
+        <div className="mb-8 p-4 bg-gray-50 rounded-xl shadow-inner border border-gray-200">
+          <h2 className="text-2xl font-semibold text-purple-600 mb-4">Knowledge Library</h2>
+          <p className="text-gray-700 mb-3">
+            Paste text to summarize or ask questions about its content.
+          </p>
+          <textarea
+            className="w-full p-3 border border-purple-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-400 mb-4 h-32 resize-y"
+            placeholder="Paste your text here (e.g., an article, report, or notes)..."
+            value={knowledgeInput}
+            onChange={(e) => {
+              setKnowledgeInput(e.target.value);
+              setKnowledgeSummary(''); // Clear summary when input changes
+              setKnowledgeAnswer(''); // Clear answer when input changes
+            }}
+            disabled={loading}
+          ></textarea>
+          <button
+            onClick={summarizeKnowledge}
+            className="w-full px-5 py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition-colors shadow-md mb-4"
+            disabled={loading || !knowledgeInput.trim()}
+          >
+            Summarize Text
+          </button>
+          {knowledgeSummary && (
+            <div className="mt-4 p-4 bg-blue-50 rounded-xl text-blue-800 border border-blue-200">
+              <h3 className="font-semibold mb-2">Summary:</h3>
+              <p>{knowledgeSummary}</p>
+            </div>
+          )}
+          <div className="mt-4 flex items-center">
+            <input
+              type="text"
+              className="flex-grow p-3 border border-purple-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-400 mr-3"
+              placeholder="Ask a question about the text..."
+              value={knowledgeQuestion}
+              onChange={(e) => setKnowledgeQuestion(e.target.value)}
+              onKeyPress={(e) => { if (e.key === 'Enter') askKnowledgeQuestion(); }}
+              disabled={loading || !knowledgeInput.trim()}
+            />
+            <button
+              onClick={askKnowledgeQuestion}
+              className="px-5 py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition-colors shadow-md"
+              disabled={loading || !knowledgeInput.trim() || !knowledgeQuestion.trim()}
+            >
+              Ask Question
+            </button>
+          </div>
+          {knowledgeAnswer && (
+            <div className="mt-4 p-4 bg-blue-50 rounded-xl text-blue-800 border border-blue-200">
+              <h3 className="font-semibold mb-2">Answer:</h3>
+              <p>{knowledgeAnswer}</p>
+            </div>
+          )}
+        </div>
+
+        {/* Daily Reflection Journal Section */}
+        <div className="mb-8 p-4 bg-gray-50 rounded-xl shadow-inner border border-gray-200">
+          <h2 className="text-2xl font-semibold text-purple-600 mb-4">Daily Reflection Journal</h2>
+          <p className="text-gray-700 mb-3">
+            Jot down your thoughts and feelings. Lil A-Shanti can offer insights.
+          </p>
+          <textarea
+            className="w-full p-3 border border-purple-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-400 mb-4 h-32 resize-y"
+            placeholder="What's on your mind today? What happened? How do you feel?"
+            value={journalEntry}
+            onChange={(e) => setJournalEntry(e.target.value)}
+            disabled={loading}
+          ></textarea>
+          <button
+            onClick={saveJournalEntry}
+            className="w-full px-5 py-3 bg-pink-600 text-white rounded-xl hover:bg-pink-700 transition-colors shadow-md mb-4"
+            disabled={loading}
+          >
+            Save Entry
+          </button>
+          <div className="scrollable-content bg-pink-50 p-3 rounded-xl border border-pink-200">
+            <h3 className="text-lg font-medium text-pink-700 mb-2">Your Journal History:</h3>
+            {journalHistory.length === 0 ? (
+              <p className="text-gray-500 italic">No journal entries yet. Start writing!</p>
+            ) : (
+              <ul>
+                {journalHistory.map((entry) => (
+                  <li key={entry.id} className="text-gray-700 text-sm py-1 border-b border-pink-100 last:border-b-0">
+                    <p className="font-semibold text-pink-800">{new Date(entry.timestamp).toLocaleDateString()}</p>
+                    <p className="italic mb-1">{entry.entry.substring(0, 100)}...</p>
+                    <button
+                      onClick={() => getJournalInsight(entry.entry)}
+                      className="text-xs text-pink-600 hover:underline"
+                      disabled={loading}
+                    >
+                      Get Insight
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+
+        {/* Personalized Learning Paths Section */}
+        <div className="mb-8 p-4 bg-gray-50 rounded-xl shadow-inner border border-gray-200">
+          <h2 className="text-2xl font-semibold text-purple-600 mb-4">Personalized Learning Paths</h2>
+          <p className="text-gray-700 mb-3">
+            Tell Lil A-Shanti what you want to learn, and it will suggest a roadmap.
+          </p>
+          <input
+            type="text"
+            className="w-full p-3 border border-purple-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-400 mb-4"
+            placeholder="e.g., 'Learn about artificial intelligence' or 'Improve my writing skills'"
+            value={learningTopic}
+            onChange={(e) => setLearningTopic(e.target.value)}
+            disabled={loading}
+          />
+          <button
+            onClick={generateLearningPath}
+            className="w-full px-5 py-3 bg-orange-600 text-white rounded-xl hover:bg-orange-700 transition-colors shadow-md mb-4"
+            disabled={loading || !learningTopic.trim()}
+          >
+            Generate Learning Path
+          </button>
+          {learningPath && (
+            <div className="mt-4 p-4 bg-orange-50 rounded-xl text-orange-800 border border-orange-200">
+              <h3 className="font-semibold mb-2">Your Learning Path:</h3>
+              <div className="scrollable-content">
+                <p className="whitespace-pre-wrap">{learningPath}</p>
+              </div>
+            </div>
+          )}
+          {learningPathsHistory.length > 0 && (
+            <div className="mt-4 scrollable-content bg-orange-50 p-3 rounded-xl border border-orange-200">
+              <h3 className="text-lg font-medium text-orange-700 mb-2">Past Learning Paths:</h3>
+              <ul>
+                {learningPathsHistory.map((pathEntry) => (
+                  <li key={pathEntry.id} className="text-gray-700 text-sm py-1 border-b border-orange-100 last:border-b-0">
+                    <p className="font-semibold text-orange-800">{pathEntry.topic}</p>
+                    <p className="italic mb-1">{pathEntry.path.substring(0, 100)}...</p>
+                    <span className="text-xs text-gray-500 mt-1 block">
+                      Generated on: {new Date(pathEntry.timestamp).toLocaleDateString()}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+
+        {/* Aura's Insights Section */}
+        <div className="mb-8 p-4 bg-gray-50 rounded-xl shadow-inner border border-gray-200">
+          <h2 className="text-2xl font-semibold text-purple-600 mb-4">Aura's Insights</h2>
+          <p className="text-gray-700 mb-3">
+            Get a holistic insight from Aura based on your journey with Lil A-Shanti.
+          </p>
+          <button
+            onClick={getAuraInsight}
+            className="w-full px-5 py-3 bg-yellow-600 text-white rounded-xl hover:bg-yellow-700 transition-colors shadow-md"
+            disabled={loading}
+          >
+            Get Personalized Insight
+          </button>
+          {auraInsight && (
+            <div className="mt-4 p-4 bg-yellow-50 rounded-xl text-yellow-800 border border-yellow-200">
+              <h3 className="font-semibold mb-2">Aura's Insight for You:</h3>
+              <p>{auraInsight}</p>
+            </div>
+          )}
+        </div>
+
+        {/* Consultation Mode Section */}
+        <div className="mb-8 p-4 bg-gray-50 rounded-xl shadow-inner border border-gray-200">
+          <h2 className="text-2xl font-semibold text-purple-600 mb-4">Consultation & Guidance</h2>
+          <p className="text-gray-700 mb-3">
+            Describe a situation or conversation (personal or business) you'd like Lil A-Shanti's guidance on.
+            Lil A-Shanti will analyze it and offer insights.
+          </p>
+          <textarea
+            className="w-full p-3 border border-purple-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-400 mb-4 h-32 resize-y"
+            placeholder="e.g., 'I had a difficult conversation with my colleague about project deadlines. They seemed upset. How could I have handled it better?' or 'I'm considering investing in X company. What are the pros and cons I should consider from a strategic perspective?'"
+            value={consultationInput}
+            onChange={(e) => setConsultationInput(e.target.value)}
+            disabled={loading}
+          ></textarea>
+          <button
+            onClick={handleConsultationSubmit}
+            className="w-full px-5 py-3 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 transition-colors shadow-md"
+            disabled={loading}
+          >
+            Get Lil A-Shanti's Guidance
+          </button>
+          {consultationResponse && (
+            <div className="mt-4 p-4 bg-indigo-50 rounded-xl text-indigo-800 border border-indigo-200">
+              <h3 className="font-semibold mb-2">Lil A-Shanti's Guidance:</h3>
+              <p>{consultationResponse}</p>
+            </div>
+          )}
+          {consultationHistory.length > 0 && (
+            <div className="mt-4 scrollable-content bg-indigo-50 p-3 rounded-xl border border-indigo-200">
+              <h3 className="text-lg font-medium text-indigo-700 mb-2">Past Consultations:</h3>
+              <ul>
+                {consultationHistory.map((entry, index) => (
+                  <li key={entry.id || index} className="text-gray-700 text-sm py-1 border-b border-indigo-100 last:border-b-0">
+                    <p className="font-semibold">Your Situation:</p>
+                    <p className="italic mb-1">{entry.input}</p>
+                    <p className="font-semibold">Lil A-Shanti's Guidance:</p>
+                    <p>{entry.response}</p>
+                    {entry.summary && (
+                      <p className="font-semibold mt-1">Summary: <span className="font-normal italic">{entry.summary}</span></p>
+                    )}
+                    <span className="text-xs text-gray-500 mt-1 block">
+                      {new Date(entry.timestamp).toLocaleDateString()}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+
+        {/* Role-play Mode Section */}
+        <div className="mb-8 p-4 bg-gray-50 rounded-xl shadow-inner border border-gray-200">
+          <h2 className="text-2xl font-semibold text-purple-600 mb-4">Simulated Conversation Practice</h2>
+          <p className="text-gray-700 mb-3">
+            Practice difficult conversations or negotiations. Describe the scenario and the persona Lil A-Shanti should adopt.
+          </p>
+          <input
+            type="text"
+            className="w-full p-3 border border-purple-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-400 mb-3"
+            placeholder="Scenario (e.g., 'Negotiating a raise')"
+            value={rolePlayScenario}
+            onChange={(e) => setRolePlayScenario(e.target.value)}
+            disabled={loading}
+          />
+          <input
+            type="text"
+            className="w-full p-3 border border-purple-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-200 mb-4"
+            placeholder="Persona for Lil A-Shanti (e.g., 'A tough but fair boss')"
+            value={rolePlayPersona}
+            onChange={(e) => setRolePlayPersona(e.target.value)}
+            disabled={loading}
+          />
+          <button
+            onClick={startRolePlay}
+            className="w-full px-5 py-3 bg-green-600 text-white rounded-xl hover:bg-green-700 transition-colors shadow-md mb-4"
+            disabled={loading || !rolePlayScenario.trim() || !rolePlayPersona.trim()}
+          >
+            Start Role-Play
+          </button>
+
+          {rolePlayConversation.length > 0 && (
+            <>
+              <div className="chat-container flex flex-col space-y-3 p-4 bg-white rounded-lg border border-gray-300 mb-4">
+                {rolePlayConversation.map((msg, index) => (
+                  <div
+                    key={index}
+                    className={`p-3 rounded-lg max-w-[80%] shadow-sm ${
+                      msg.role === 'user' ? 'user-message ml-auto' : 'lilashanti-rp-message mr-auto'
+                    }`}
+                  >
+                    <p className="text-sm">{msg.text}</p>
+                    <span className="text-xs text-gray-500 mt-1 block">
+                      {new Date(msg.timestamp).toLocaleTimeString()}
+                    </span>
+                  </div>
+                ))}
+                <div ref={rolePlayMessagesEndRef} />
+              </div>
+              <div className="flex items-center mb-4">
+                <input
+                  type="text"
+                  className="flex-grow p-3 border border-purple-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-400"
+                  placeholder="Your response in the role-play..."
+                  value={currentRolePlayMessage}
+                  onChange={(e) => setCurrentRolePlayMessage(e.target.value)}
+                  onKeyPress={(e) => { if (e.key === 'Enter') handleRolePlayMessage(); }}
+                  disabled={loading}
+                />
+                <button
+                  onClick={handleRolePlayMessage}
+                  className="ml-3 px-5 py-3 bg-purple-600 text-white rounded-xl hover:bg-purple-700 transition-colors shadow-md"
+                  disabled={loading}
+                >
+                  Respond
+                </button>
+                <button
+                  onClick={() => isListening ? stopListening() : startListening(setCurrentRolePlayMessage)}
+                  className={`ml-3 px-4 py-3 rounded-xl transition-colors shadow-md ${
+                    isListening ? 'bg-red-500 hover:bg-red-600' : 'bg-blue-500 hover:bg-blue-600'
+                  } text-white`}
+                  disabled={loading}
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-6 h-6">
+                    {isListening ? (
+                      <path d="M18.707 6.707a1 1 0 00-1.414-1.414L12 10.586 6.707 5.293a1 1 0 00-1.414 1.414L10.586 12l-5.293 5.293a1 1 0 001.414 1.414L12 13.414l5.293 5.293a1 1 0 001.414-1.414L13.414 12l5.293-5.293z" />
+                    ) : (
+                      <path d="M8.707 15.707a1 1 0 001.414 0L12 13.414l1.879 1.879a1 1 0 001.414-1.414L13.414 12l1.879-1.879a1 1 0 00-1.414-1.414L12 10.586l-1.879-1.879a1 1 0 00-1.414 1.414L10.586 12l-1.879 1.879a1 1 0 000 1.414zM12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm0 18c-4.411 0-8-3.589-8-8s3.589-8 8-8 8 3.589 8 8-3.589 8-8 8z" />
+                )}
+              </svg>
+            </button>
+          </div>
+          <button
+            onClick={getRolePlayFeedback}
+            className="w-full px-5 py-3 bg-yellow-600 text-white rounded-xl hover:bg-yellow-700 transition-colors shadow-md"
+            disabled={loading || rolePlayConversation.length === 0}
+          >
+            Get Feedback on Role-Play
+          </button>
+          {rolePlayFeedback && (
+            <div className="mt-4 p-4 bg-yellow-50 rounded-xl text-yellow-800 border border-yellow-200">
+              <h3 className="font-semibold mb-2">Lil A-Shanti's Feedback:</h3>
+              <p>{rolePlayFeedback}</p>
+            </div>
+          )}
+        </>
+      )}
+      {rolePlayHistory.length > 0 && (
+        <div className="mt-4 scrollable-content bg-yellow-50 p-3 rounded-xl border border-yellow-200">
+          <h3 className="text-lg font-medium text-yellow-700 mb-2">Past Role-Play Sessions:</h3>
+          <ul>
+            {rolePlayHistory.map((session, index) => (
+              <li key={session.id || index} className="text-gray-700 text-sm py-1 border-b border-yellow-100 last:border-b-0">
+                <p className="font-semibold">Scenario: <span className="font-normal italic">{session.scenarioDescription}</span></p>
+                <p className="font-semibold">Persona: <span className="font-normal italic">{session.otherPersonPersona}</span></p>
+                {session.feedback && (
+                  <p className="font-semibold mt-1">Feedback Summary: <span className="font-normal italic">{session.feedback.substring(0, 100)}...</span></p>
+                )}
+                <span className="text-xs text-gray-500 mt-1 block">
+                      {new Date(session.timestamp).toLocaleDateString()}
+                    </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+
+    {/* Mood Tracker Section */}
+    <div className="mb-8 p-4 bg-gray-50 rounded-xl shadow-inner border border-gray-200">
+      <h2 className="text-2xl font-semibold text-purple-600 mb-4">How are you feeling today?</h2>
+      <div className="flex items-center mb-4">
+        <input
+          type="text"
+          className="flex-grow p-3 border border-purple-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-400"
+          placeholder="e.g., Happy, Calm, Stressed..."
+          value={currentMood}
+          onChange={(e) => setCurrentMood(e.target.value)}
+          onKeyPress={(e) => { if (e.key === 'Enter') addMoodEntry(); }}
+          disabled={loading}
+        />
+        <button
+          onClick={addMoodEntry}
+          className="ml-3 px-5 py-3 bg-purple-600 text-white rounded-xl hover:bg-purple-700 transition-colors shadow-md"
+          disabled={loading}
+        >
+          Log Mood
+        </button>
+      </div>
+      <button
+        onClick={handleProactiveCheckin}
+        className="w-full px-5 py-3 bg-teal-600 text-white rounded-xl hover:bg-teal-700 transition-colors shadow-md mt-2"
+        disabled={loading || moodEntries.length === 0}
+      >
+        Ask Lil A-Shanti for a Check-in
+      </button>
+      <div className="scrollable-content bg-purple-50 p-3 rounded-xl border border-purple-200 mt-4">
+        <h3 className="text-lg font-medium text-purple-700 mb-2">Your Mood History:</h3>
+        {moodEntries.length === 0 ? (
+          <p className="text-gray-500 italic">No mood entries yet. Share how you're feeling!</p>
+        ) : (
+          <ul>
+            {moodEntries.map((entry) => (
+              <li key={entry.id} className="text-gray-700 text-sm py-1 border-b border-purple-100 last:border-b-0">
+                <span className="font-semibold">{entry.mood}</span> - {new Date(entry.timestamp).toLocaleString()}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+
+    {/* Affirmations Section */}
+    <div className="p-4 bg-gray-50 rounded-xl shadow-inner border border-gray-200">
+      <h2 className="text-2xl font-semibold text-purple-600 mb-4">Your Affirmations</h2>
+      <div className="flex items-center mb-4">
+        <input
+          type="text"
+          className="flex-grow p-3 border border-purple-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-400"
+          placeholder="Type a positive affirmation..."
+          value={newAffirmation}
+          onChange={(e) => setNewAffirmation(e.target.value)}
+          onKeyPress={(e) => { if (e.key === 'Enter') addAffirmation(); }}
+          disabled={loading}
+        />
+        <button
+          onClick={addAffirmation}
+          className="ml-3 px-5 py-3 bg-purple-600 text-white rounded-xl hover:bg-purple-700 transition-colors shadow-md"
+          disabled={loading}
+        >
+          Add
+        </button>
+      </div>
+      <div className="flex justify-center mb-4">
+        <button
+          onClick={generateAffirmation}
+          className="px-5 py-3 bg-indigo-500 text-white rounded-xl hover:bg-indigo-600 transition-colors shadow-md mr-2"
+          disabled={loading}
+        >
+          Generate Affirmation
+        </button>
+        {newAffirmation && (
+          <button
+            onClick={() => speakLilAShantiResponse(newAffirmation)}
+            className="px-5 py-3 bg-green-500 text-white rounded-xl hover:bg-green-600 transition-colors shadow-md"
+            disabled={loading}
+          >
+            Speak Affirmation
+          </button>
+        )}
+      </div>
+      <div className="scrollable-content bg-purple-50 p-3 rounded-xl border border-purple-200">
+        <h3 className="text-lg font-medium text-purple-700 mb-2">Your Affirmation List:</h3>
+        {affirmations.length === 0 ? (
+          <p className="text-gray-500 italic">No affirmations yet. Add one or generate a new one!</p>
+        ) : (
+          <ul>
+            {affirmations.map((aff) => (
+              <li key={aff.id} className="text-gray-700 text-sm py-1 border-b border-purple-100 last:border-b-0">
+                {aff.text} - {new Date(aff.timestamp).toLocaleDateString()}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  </div>
+</div>
+);
+}
+
+export default App;
