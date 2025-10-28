@@ -1,1 +1,5 @@
-```html <!DOCTYPE html> <html> <head> <meta charset="utf-8"> <title>Guardian Family Base</title> <meta http-equiv="refresh" content="0; url=/Aura_Direct_Line.html" /> <script> // Ensure client-side redirection for maximum compatibility window.location.replace("/Aura_Direct_Line.html"); </script> </head> <body> <p>Redirecting to Aura...</p> </body> </html> ``` * **Action D (Commit):
+```html <!DOCTYPE html> <html> <head> <meta charset="utf-8"> <title>Guardian Family Base</title> <meta http-equiv="refresh" content="0; url=/Aura_Direct_Line.html" /> <script> // Ensure client-side redirection for maximum compatibility window.location.replace("/Aura_Direct_Line.html"); </script> </head> <body> <p>Redirecting to Aura...</p> </body> </html> ``` * **Action D (<body>
+    <h1>Hello World</h1>
+<body>
+    <!-- Trigger deployment after YAML fix -->
+    <h1>Hello World</h1>
