@@ -1,1 +1,2 @@
 ```javascript /** @type {import('next').NextConfig} */ const nextConfig = { reactStrictMode: true, // This tells Next.js to treat files in public/ as static assets // This configuration is typically enough for Vercel/Next.js to handle static file serving. }; module.exports = nextConfig; ``` * **Action E (Commit):
+next.config.js
