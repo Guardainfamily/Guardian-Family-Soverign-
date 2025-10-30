@@ -1,4 +1,4 @@
-name: Deploy Next.js Static Export to Firebase Hosting
+name: Deploy Next.js Static Site to Firebase Hosting
 
 on:
 push:
@@ -8,32 +8,35 @@ branches:
 jobs:
 build_and_deploy:
 runs-on: ubuntu-latest
-steps:
-- name: ⬇️ Checkout Repository
-uses: actions/checkout@v4
+environment: production
 
-  - name: 🛠️ Set up Node.js
+steps:
+  # 1. Checkout the repository code
+  - name: Checkout Code
+    uses: actions/checkout@v4
+
+  # 2. Setup Node.js environment
+  - name: Setup Node
     uses: actions/setup-node@v4
     with:
-      node-version: '20'
+      node-version: 20
       cache: 'npm'
 
-  - name: 📦 Install Dependencies
-    run: npm ci
-
-  - name: 🏗️ Build and Export Static Site
+  # 3. Install dependencies and build the static site
+  - name: Install and Build
     run: |
-      # 1. Build the Next.js project
+      npm ci
       npm run build
-      # 2. Run the static export step
-      npm run export
-
-  - name: 🚀 Deploy to Firebase
+      
+  # 4. Deploy to Firebase Hosting (This block starts around line 30, but
+  #    the core issue is usually in the 'uses' or 'with' indentation)
+  - name: Deploy to Firebase
     uses: FirebaseExtended/action-hosting-deploy@v0
     with:
       repoToken: '${{ secrets.GITHUB_TOKEN }}'
       firebaseServiceAccount: '${{ secrets.FIREBASE_SERVICE_ACCOUNT_PROJECT_ID }}'
       channelId: live
       projectId: 'next-js-site-ac1f6'
+      
       # The public directory for Next.js static export is 'out'
       public: out
