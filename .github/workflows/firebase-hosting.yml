@@ -35,7 +35,5 @@ uses: actions/checkout@v4
       firebaseServiceAccount: '${{ secrets.FIREBASE_SERVICE_ACCOUNT_PROJECT_ID }}'
       channelId: live
       projectId: 'next-js-site-ac1f6'
-      entryPoint: .
-      
       # The public directory for Next.js static export is 'out'
       public: out
